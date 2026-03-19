@@ -1,0 +1,23 @@
+# === 공통 ===
+fastapi
+uvicorn
+python-multipart
+requests
+
+# === V1: 활자체 문서 추출 ===
+pdfplumber
+python-docx
+lxml
+pypdfium2
+
+# === V1: 스캔 PDF OCR 폴백 ===
+paddleocr
+paddlepaddle-gpu
+opencv-python-headless
+numpy
+Pillow
+tqdm
+
+# === V2: 손글씨 ===
+# chandra (별도 설치 필요 — pip install chandra 또는 수동 설치)
+# libreoffice (시스템 패키지 — sudo apt install libreoffice)
