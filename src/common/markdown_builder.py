@@ -2,7 +2,15 @@
 페이지별 추출 결과를 최종 마크다운 문서로 조립
 """
 import os
+import logging
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+def _strip_surrogates(text: str) -> str:
+    """UTF-8로 저장할 수 없는 surrogate code point 제거."""
+    return "".join(ch for ch in text if not 0xD800 <= ord(ch) <= 0xDFFF)
 
 
 def build_markdown(pages: list, filename: str = "") -> str:
@@ -37,7 +45,6 @@ def build_markdown(pages: list, filename: str = "") -> str:
             parts.append(text)
             parts.append("")
 
-        # text에 포함되지 않은 별도 표가 있을 때만 추가 (V2/DOCX 등)
         for table_md in tables:
             if table_md and table_md not in text:
                 parts.append(f"\n{table_md}\n")
@@ -63,9 +70,10 @@ def save_markdown(content: str, output_dir: str, filename: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     md_filename = f"{filename}_result.md"
     save_path = os.path.join(output_dir, md_filename)
+    sanitized_content = _strip_surrogates(content)
 
     with open(save_path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(sanitized_content)
 
-    print(f"✅ Markdown saved: {save_path}")
+    logger.info("Markdown saved: %s", save_path)
     return save_path

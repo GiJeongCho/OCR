@@ -1,23 +1,21 @@
 # === 공통 ===
-fastapi
-uvicorn
-python-multipart
-requests
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
 
-# === V1: 활자체 문서 추출 ===
-pdfplumber
-python-docx
-lxml
-pypdfium2
+# === 활자체 문서 추출 ===
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+lxml>=5.0.0
+pypdfium2>=4.0.0
 
-# === V1: 스캔 PDF OCR 폴백 ===
-paddleocr
-paddlepaddle-gpu
-opencv-python-headless
-numpy
-Pillow
-tqdm
+# === 스캔 PDF OCR 폴백 ===
+paddleocr>=2.8.0
+paddlepaddle-gpu>=2.6.0
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+Pillow>=10.0.0
+tqdm>=4.66.0
 
-# === V2: 손글씨 ===
-# chandra (별도 설치 필요 — pip install chandra 또는 수동 설치)
-# libreoffice (시스템 패키지 — sudo apt install libreoffice)
+# === HWP 변환 ===
+olefile==0.47

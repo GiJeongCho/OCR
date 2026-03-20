@@ -6,16 +6,18 @@ HWP(한글 바이너리 포맷) → PDF 변환 후 pdf_extractor로 처리
   3차) olefile로 HWP 바이너리 직접 파싱 (텍스트+표 추출)
 """
 import os
-import re
 import struct
 import subprocess
 import tempfile
 import shutil
-import sys
 import zlib
+import logging
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.table_formatter import table_to_markdown
+from ..common.config import LIBREOFFICE_TIMEOUT
+from ..common.table_formatter import table_to_markdown
+from ..common.pdf_utils import detect_footer_page_number
+
+logger = logging.getLogger(__name__)
 
 
 def check_libreoffice() -> bool:
@@ -36,15 +38,15 @@ def _run_libreoffice(input_path: str, output_dir: str, convert_to: str = "pdf") 
         os.path.abspath(input_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=LIBREOFFICE_TIMEOUT)
         if result.stdout:
-            print(f"   LibreOffice stdout: {result.stdout.strip()}")
+            logger.debug("LibreOffice stdout: %s", result.stdout.strip())
         if result.stderr:
-            print(f"   LibreOffice stderr: {result.stderr.strip()}")
+            logger.debug("LibreOffice stderr: %s", result.stderr.strip())
         if result.returncode != 0:
             return None
     except subprocess.TimeoutExpired:
-        print("   ⚠️ LibreOffice 변환 타임아웃 (120초)")
+        logger.warning("LibreOffice 변환 타임아웃 (%d초)", LIBREOFFICE_TIMEOUT)
         return None
     finally:
         shutil.rmtree(user_install_dir, ignore_errors=True)
@@ -65,26 +67,26 @@ def _convert_hwp_via_pyhwp(hwp_path: str, output_dir: str) -> str | None:
     try:
         import hwp5  # noqa: F401
     except ImportError:
-        print("   ⚠️ pyhwp 미설치, 건너뜀")
+        logger.debug("pyhwp 미설치, 건너뜀")
         return None
 
     odt_dir = tempfile.mkdtemp(prefix="hwp_odt_")
     base_name = os.path.splitext(os.path.basename(hwp_path))[0]
     odt_path = os.path.join(odt_dir, f"{base_name}.odt")
-    print("   🔄 pyhwp: HWP → ODT 변환 중...")
+    logger.info("pyhwp: HWP → ODT 변환 중...")
     try:
         result = subprocess.run(
             ["hwp5odt", os.path.abspath(hwp_path), "--output", odt_path],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=LIBREOFFICE_TIMEOUT,
         )
         if result.returncode != 0 or not os.path.exists(odt_path):
             stderr = result.stderr.strip() if result.stderr else "(없음)"
-            print(f"   ⚠️ hwp5odt 실패: {stderr[:200]}")
+            logger.warning("hwp5odt 실패: %s", stderr[:200])
             return None
-        print("   ✅ ODT 변환 완료, LibreOffice로 PDF 생성 중...")
+        logger.info("ODT 변환 완료, LibreOffice로 PDF 생성 중...")
         return _run_libreoffice(odt_path, output_dir, "pdf")
     except Exception as e:
-        print(f"   ⚠️ pyhwp 폴백 실패: {e}")
+        logger.warning("pyhwp 폴백 실패: %s", e)
         return None
     finally:
         shutil.rmtree(odt_dir, ignore_errors=True)
@@ -94,14 +96,12 @@ def _convert_hwp_via_pyhwp(hwp_path: str, output_dir: str) -> str | None:
 # 3차 폴백: olefile 직접 HWP 바이너리 파싱
 # ============================================================
 HWPTAG_BEGIN = 0x010
-HWPTAG_PARA_TEXT = HWPTAG_BEGIN + 51        # 67
-HWPTAG_CTRL_HEADER = HWPTAG_BEGIN + 55      # 71
-HWPTAG_LIST_HEADER = HWPTAG_BEGIN + 56      # 72
-HWPTAG_TABLE = HWPTAG_BEGIN + 61            # 77
+HWPTAG_PARA_TEXT = HWPTAG_BEGIN + 51
+HWPTAG_CTRL_HEADER = HWPTAG_BEGIN + 55
+HWPTAG_LIST_HEADER = HWPTAG_BEGIN + 56
+HWPTAG_TABLE = HWPTAG_BEGIN + 61
 
-# 확장 컨트롤: 전체 8 WCHAR 차지 (코드 1 WCHAR + 인라인 7 WCHAR = 14바이트 스킵)
 _EXTENDED_CONTROLS = frozenset(range(1, 24)) - {9, 10, 13}
-
 GSO_CTRL_ID = b' osg'
 
 
@@ -122,6 +122,8 @@ def _parse_para_text(data: bytes) -> str:
             i += 14
             continue
         if code < 0x0020:
+            continue
+        if 0xD800 <= code <= 0xDFFF:
             continue
         chars.append(chr(code))
     return "".join(chars)
@@ -146,12 +148,10 @@ def _parse_records(data: bytes) -> list[tuple[int, int, bytes]]:
             pos += 4
         if pos + size > length:
             break
-        records.append((tag_id, level, data[pos : pos + size]))
+        records.append((tag_id, level, data[pos:pos + size]))
         pos += size
     return records
 
-
-# ------ 네이티브 TABLE 파싱 (HWPTAG_TABLE이 있는 HWP용) ------
 
 def _extract_native_table_at(records: list, start_idx: int) -> tuple[str, int]:
     """HWPTAG_TABLE 레코드부터 네이티브 테이블 파싱."""
@@ -204,8 +204,6 @@ def _extract_native_table_at(records: list, start_idx: int) -> tuple[str, int]:
         table_2d.append(row)
     return table_to_markdown(table_2d), j
 
-
-# ------ 글상자(gso) 기반 테이블 감지 ------
 
 def _collect_shape_cells(records: list) -> list[tuple[int, int, int, str, int]]:
     """
@@ -310,7 +308,7 @@ def _group_shapes_spatially(cells: list) -> tuple[list[list], list]:
 
     전략:
       1. 셀들을 행(row)으로 클러스터링
-      2. 멀티 컬럼(≥2) 행을 기준점으로 삼고, 그 사이의 싱글 컬럼 행도 표에 포함
+      2. 멀티 컬럼(>=2) 행을 기준점으로 삼고, 그 사이의 싱글 컬럼 행도 표에 포함
       3. 마지막 멀티 컬럼 행 이후 싱글 컬럼 행은 간격이 작으면 표, 크면 본문
       4. 멀티 컬럼 행이 없는 구간은 본문 텍스트
 
@@ -333,7 +331,6 @@ def _group_shapes_spatially(cells: list) -> tuple[list[list], list]:
     first_mc = multi_col_indices[0]
     last_mc = multi_col_indices[-1]
 
-    # 멀티 컬럼 행 사이의 vert 간격 기준으로 표 내부 행 간격 추정
     row_verts = [min(c[1] for c in row) for row in rows]
     table_range_gaps = []
     for i in range(first_mc, last_mc):
@@ -348,11 +345,9 @@ def _group_shapes_spatially(cells: list) -> tuple[list[list], list]:
 
     table_rows_idx: set[int] = set()
 
-    # 멀티 컬럼 행 + 그 사이의 모든 행 포함
     for i in range(first_mc, last_mc + 1):
         table_rows_idx.add(i)
 
-    # 마지막 멀티 컬럼 행 이후: vert 간격이 작으면 표에 포함
     proximity_threshold = typical_gap * 1.5
     for i in range(last_mc + 1, len(rows)):
         gap = abs(row_verts[i] - row_verts[i - 1])
@@ -361,7 +356,6 @@ def _group_shapes_spatially(cells: list) -> tuple[list[list], list]:
         else:
             break
 
-    # 첫 멀티 컬럼 행 이전: vert 간격이 작으면 표에 포함
     for i in range(first_mc - 1, -1, -1):
         gap = abs(row_verts[i + 1] - row_verts[i])
         if gap <= proximity_threshold:
@@ -369,7 +363,6 @@ def _group_shapes_spatially(cells: list) -> tuple[list[list], list]:
         else:
             break
 
-    # 그룹 분리: 연속된 table row indices → 하나의 테이블 그룹
     table_groups = []
     body_cells = []
     sorted_table_idx = sorted(table_rows_idx)
@@ -399,13 +392,10 @@ def _group_shapes_spatially(cells: list) -> tuple[list[list], list]:
     return table_groups, body_cells
 
 
-# ------ 섹션 파서 (본문 + 네이티브 TABLE + gso 테이블) ------
-
 def _parse_hwp_section(data: bytes) -> str:
     """하나의 BodyText/Section 스트림에서 텍스트+표를 추출."""
     records = _parse_records(data)
 
-    # 1) 네이티브 TABLE 범위 식별
     native_table_starts: dict[int, tuple[int, str]] = {}
     native_table_indices: set[int] = set()
     i = 0
@@ -420,11 +410,9 @@ def _parse_hwp_section(data: bytes) -> str:
             continue
         i += 1
 
-    # 2) gso(글상자) 기반 셀 수집 및 공간 분석
     shape_cells = _collect_shape_cells(records)
     table_groups, body_text_cells = _group_shapes_spatially(shape_cells)
 
-    # 테이블 그룹 → 마크다운 변환
     gso_table_anchors: dict[int, str] = {}
     gso_table_indices: set[int] = set()
 
@@ -437,7 +425,6 @@ def _parse_hwp_section(data: bytes) -> str:
                 for k in range(c[0], c[4]):
                     gso_table_indices.add(k)
 
-    # 본문 글상자 → 앵커 맵 (문서 순서대로 텍스트 삽입)
     body_text_anchors: dict[int, str] = {}
     body_text_indices: set[int] = set()
     for c in body_text_cells:
@@ -445,12 +432,10 @@ def _parse_hwp_section(data: bytes) -> str:
         for k in range(c[0], c[4]):
             body_text_indices.add(k)
 
-    # 3) 문서 순서대로 출력
     skip_indices = native_table_indices | gso_table_indices | body_text_indices
     parts: list[str] = []
     i = 0
     while i < len(records):
-        # 네이티브 TABLE
         if i in native_table_starts:
             end_i, md = native_table_starts[i]
             if md:
@@ -458,11 +443,9 @@ def _parse_hwp_section(data: bytes) -> str:
             i = end_i
             continue
 
-        # gso 테이블
         if i in gso_table_anchors:
             parts.append(f"\n{gso_table_anchors[i]}\n")
 
-        # gso 본문 텍스트
         if i in body_text_anchors:
             parts.append(body_text_anchors[i])
 
@@ -475,19 +458,6 @@ def _parse_hwp_section(data: bytes) -> str:
         i += 1
 
     return "\n".join(parts)
-
-
-def _detect_footer_page_number(text: str):
-    """페이지 하단의 '- N -' 형식 페이지 번호를 감지하고 제거."""
-    if not text:
-        return None, text
-    match = re.search(r'^\s*-\s*(\d+)\s*-\s*$', text.strip(), re.MULTILINE)
-    if match:
-        page_num = int(match.group(1))
-        cleaned = text.strip()[: match.start()] + text.strip()[match.end():]
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-        return page_num, cleaned
-    return None, text.strip()
 
 
 def _extract_hwp_direct(hwp_path: str) -> list:
@@ -519,7 +489,7 @@ def _extract_hwp_direct(hwp_path: str) -> list:
                     raw = zlib.decompress(raw)
             text = _parse_hwp_section(raw)
 
-            doc_page_num, cleaned_text = _detect_footer_page_number(text)
+            doc_page_num, cleaned_text = detect_footer_page_number(text)
             if doc_page_num is not None:
                 page_num = doc_page_num
             else:
@@ -552,17 +522,17 @@ def convert_hwp_to_pdf(hwp_path: str, output_dir: str = None) -> str:
     else:
         os.makedirs(output_dir, exist_ok=True)
 
-    print(f"🔄 HWP → PDF 변환 중: {os.path.basename(hwp_path)}")
+    logger.info("HWP → PDF 변환 중: %s", os.path.basename(hwp_path))
 
     pdf_path = _run_libreoffice(hwp_path, output_dir, "pdf")
     if pdf_path:
-        print(f"✅ 변환 완료 (LibreOffice 직접): {pdf_path}")
+        logger.info("변환 완료 (LibreOffice 직접): %s", pdf_path)
         return pdf_path
 
-    print("   ⚠️ LibreOffice 직접 변환 실패, pyhwp 폴백 시도...")
+    logger.info("LibreOffice 직접 변환 실패, pyhwp 폴백 시도...")
     pdf_path = _convert_hwp_via_pyhwp(hwp_path, output_dir)
     if pdf_path:
-        print(f"✅ 변환 완료 (pyhwp 폴백): {pdf_path}")
+        logger.info("변환 완료 (pyhwp 폴백): %s", pdf_path)
         return pdf_path
 
     raise RuntimeError(f"HWP → PDF 변환 실패: {hwp_path}")
@@ -570,7 +540,7 @@ def convert_hwp_to_pdf(hwp_path: str, output_dir: str = None) -> str:
 
 def extract_hwp(hwp_path: str) -> list:
     """HWP에서 페이지별 데이터 추출."""
-    from v1_printed.pdf_extractor import extract_pdf
+    from .pdf_extractor import extract_pdf
 
     try:
         pdf_path = convert_hwp_to_pdf(hwp_path)
@@ -583,15 +553,16 @@ def extract_hwp(hwp_path: str) -> list:
     except RuntimeError:
         pass
 
-    print("   🔄 olefile 직접 파싱으로 텍스트/표 추출 중...")
+    logger.info("olefile 직접 파싱으로 텍스트/표 추출 중...")
     pages = _extract_hwp_direct(hwp_path)
-    print(f"✅ HWP 직접 파싱 완료: {len(pages)}개 섹션")
+    logger.info("HWP 직접 파싱 완료: %d개 섹션", len(pages))
     return pages
 
 
 if __name__ == "__main__":
+    import sys
     if len(sys.argv) < 2:
-        print("Usage: python hwp_converter.py <file.hwp>")
+        print("Usage: python -m src.v1_printed.hwp_converter <file.hwp>")
         exit()
     result = extract_hwp(sys.argv[1])
     for p in result:

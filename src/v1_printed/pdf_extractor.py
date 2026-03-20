@@ -4,14 +4,18 @@
 - 표를 본문 위치에 삽입
 - 불완전한 표(세로 텍스트, 병합 셀 등)는 PPStructure로 폴백
 """
-import os
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-import re
-import pdfplumber
-import sys
+import logging
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.table_formatter import table_to_markdown
+import cv2
+import numpy as np
+import pdfplumber
+import pypdfium2 as pdfium
+
+from ..common.config import *  # noqa: F401
+from ..common.table_formatter import table_to_markdown
+from ..common.pdf_utils import detect_footer_page_number
+
+logger = logging.getLogger(__name__)
 
 _ppstructure_cache = {}
 
@@ -27,14 +31,12 @@ def is_scanned_pdf(pdf_path: str, sample_pages: int = 3, min_chars: int = 50) ->
                     return False
         return True
     except Exception as e:
-        print(f"⚠️ PDF 판별 실패: {e}")
+        logger.warning("PDF 판별 실패: %s", e)
         return True
 
 
 def _clean_table_data(table_data: list) -> list:
-    """
-    표 데이터 정리: 완전히 비어있는 행 제거, None 정리
-    """
+    """표 데이터 정리: 완전히 비어있는 행 제거, None 정리"""
     if not table_data:
         return []
 
@@ -65,33 +67,8 @@ def _has_usable_table_data(table_data: list) -> bool:
     return non_empty >= 3
 
 
-def _detect_footer_page_number(text: str):
-    """
-    페이지 하단의 '- N -' 형식 페이지 번호를 감지하고 제거
-    표 마크다운이 푸터 뒤에 올 수 있으므로 독립된 줄 단위로 검색
-
-    Returns:
-        (page_number: int or None, cleaned_text: str)
-    """
-    if not text:
-        return None, text
-
-    match = re.search(r'^\s*-\s*(\d+)\s*-\s*$', text.strip(), re.MULTILINE)
-    if match:
-        page_num = int(match.group(1))
-        cleaned = text.strip()[: match.start()] + text.strip()[match.end() :]
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-        return page_num, cleaned
-
-    return None, text.strip()
-
-
 def _get_page_image(pdf_path, page_index, dpi=200):
-    """PDF 페이지를 numpy 이미지로 변환 (PPStructure 폴백용, lazy import)"""
-    import pypdfium2 as pdfium
-    import cv2
-    import numpy as np
-
+    """PDF 페이지를 numpy 이미지로 변환 (PPStructure 폴백용)"""
     pdf_doc = pdfium.PdfDocument(pdf_path)
     pg = pdf_doc[page_index]
     bitmap = pg.render(scale=dpi / 72.0)
@@ -109,7 +86,7 @@ def _ppstructure_for_region(pdf_path, page_index, page_height, y_top, y_bottom, 
         return _ppstructure_cache[cache_key]
 
     try:
-        from v1_printed.scan_pdf_ocr import _get_table_engine, _html_table_to_list
+        from .scan_pdf_ocr import _get_table_engine, _html_table_to_list
 
         image = _get_page_image(pdf_path, page_index, dpi)
         h, w = image.shape[:2]
@@ -124,7 +101,7 @@ def _ppstructure_for_region(pdf_path, page_index, page_height, y_top, y_bottom, 
             _ppstructure_cache[cache_key] = None
             return None
 
-        print(f"   🔄 PPStructure 폴백 (y: {y_top:.0f}~{y_bottom:.0f})...")
+        logger.info("  PPStructure 폴백 (y: %.0f~%.0f)...", y_top, y_bottom)
         result = engine(cropped)
         for item in result:
             if item.get("type") == "table":
@@ -140,7 +117,7 @@ def _ppstructure_for_region(pdf_path, page_index, page_height, y_top, y_bottom, 
         _ppstructure_cache[cache_key] = None
         return None
     except Exception as e:
-        print(f"   ⚠️ PPStructure 폴백 실패: {e}")
+        logger.warning("  PPStructure 폴백 실패: %s", e)
         _ppstructure_cache[cache_key] = None
         return None
 
@@ -165,10 +142,9 @@ def _extract_page_with_tables(page, pdf_path=None, page_index=None) -> str:
     page_height = page.height
     page_width = page.width
 
-    # 1. 표 감지
     tables = page.find_tables()
     table_bboxes = []
-    table_entries = []  # {"y": float, "content": str, "bbox": tuple}
+    table_entries = []
 
     for table in tables:
         bbox = table.bbox
@@ -197,7 +173,6 @@ def _extract_page_with_tables(page, pdf_path=None, page_index=None) -> str:
             table_bboxes.append(bbox)
             table_entries.append({"y": y_center, "content": fallback_text.strip(), "bbox": bbox})
 
-    # 2. 표 영역을 제외한 텍스트 추출
     if table_bboxes:
         def not_in_table(obj):
             obj_y = obj.get("top", 0)
@@ -213,11 +188,9 @@ def _extract_page_with_tables(page, pdf_path=None, page_index=None) -> str:
     else:
         text_only = page.extract_text() or ""
 
-    # 3. 표가 없으면 텍스트만 반환
     if not table_entries:
         return text_only.strip()
 
-    # 4. 텍스트 줄의 y좌표 추정 (표 밖 words 사용)
     text_lines = text_only.strip().split("\n") if text_only.strip() else []
 
     if not text_lines:
@@ -234,7 +207,6 @@ def _extract_page_with_tables(page, pdf_path=None, page_index=None) -> str:
         if not in_table:
             filtered_words.append(w)
 
-    # 줄별 y좌표 매핑
     line_y_positions = []
     word_idx = 0
     for line in text_lines:
@@ -246,7 +218,6 @@ def _extract_page_with_tables(page, pdf_path=None, page_index=None) -> str:
             last_y = line_y_positions[-1] if line_y_positions else page_height
             line_y_positions.append(last_y + 15)
 
-    # 5. 텍스트와 표를 y좌표 순서로 병합
     result_parts = []
     table_inserted = [False] * len(table_entries)
 
@@ -280,12 +251,12 @@ def extract_pdf(pdf_path: str) -> list:
 
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
-        print(f"📄 PDF 페이지 수: {total_pages}")
+        logger.info("PDF 페이지 수: %d", total_pages)
 
         for i, page in enumerate(pdf.pages):
             combined_text = _extract_page_with_tables(page, pdf_path=pdf_path, page_index=i)
 
-            doc_page_num, cleaned_text = _detect_footer_page_number(combined_text)
+            doc_page_num, cleaned_text = detect_footer_page_number(combined_text)
 
             if doc_page_num is not None:
                 page_num = doc_page_num
@@ -300,13 +271,16 @@ def extract_pdf(pdf_path: str) -> list:
                 "images": [],
             }
 
-            print(f"   Page {page_num} (PDF {i+1}/{total_pages}): {len(cleaned_text)} chars")
+            logger.info("  Page %s (PDF %d/%d): %d chars", page_num, i + 1, total_pages, len(cleaned_text))
             pages_result.append(page_data)
 
     return pages_result
 
 
 if __name__ == "__main__":
+    import os
+    import sys
+
     test_pdf = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "test_Data",
@@ -314,7 +288,7 @@ if __name__ == "__main__":
     )
 
     if not os.path.exists(test_pdf):
-        print(f"❌ 테스트 파일 없음: {test_pdf}")
+        print(f"테스트 파일 없음: {test_pdf}")
         exit()
 
     scanned = is_scanned_pdf(test_pdf)
@@ -324,7 +298,7 @@ if __name__ == "__main__":
         result = extract_pdf(test_pdf)
         print(f"\n총 {len(result)} 페이지 추출 완료")
         for p in result:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"--- Page {p['page_num']} ---")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             print(p["text"])

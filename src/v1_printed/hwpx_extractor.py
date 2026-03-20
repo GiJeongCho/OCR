@@ -7,13 +7,14 @@ HWPX는 ZIP 포맷으로, 내부에 XML(OWPML) 파일을 포함
   - <tbl> 발견 시 마크다운 표로 변환하여 text에 인라인 삽입
   - <tbl> 내부의 <p>는 본문 텍스트로 추출하지 않음 (셀 텍스트 중복 방지)
 """
-import os
-import sys
 import zipfile
+import logging
+
 from lxml import etree
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.table_formatter import table_to_markdown
+from ..common.table_formatter import table_to_markdown
+
+logger = logging.getLogger(__name__)
 
 
 def _tag_name(elem) -> str:
@@ -45,11 +46,10 @@ def _extract_text_from_element(elem):
 
 def _find_section_files(zf: zipfile.ZipFile) -> list:
     """HWPX ZIP 내의 section XML 파일들을 찾기"""
-    section_files = []
-    for name in zf.namelist():
-        lower = name.lower()
-        if "section" in lower and lower.endswith(".xml"):
-            section_files.append(name)
+    section_files = [
+        name for name in zf.namelist()
+        if "section" in name.lower() and name.lower().endswith(".xml")
+    ]
     section_files.sort()
     return section_files
 
@@ -59,8 +59,10 @@ def _extract_table(tbl_elem) -> list:
     table_data = []
     tr_elems = [c for c in tbl_elem if _tag_name(c) == "tr"]
     if not tr_elems:
-        tr_elems = [e for e in tbl_elem.iter()
-                     if e is not tbl_elem and _tag_name(e) == "tr"]
+        tr_elems = [
+            e for e in tbl_elem.iter()
+            if e is not tbl_elem and _tag_name(e) == "tr"
+        ]
 
     for tr in tr_elems:
         row = []
@@ -109,9 +111,6 @@ def extract_hwpx(hwpx_path: str) -> list:
     """
     HWPX 파일에서 텍스트와 표를 추출 (pageBreak 속성으로 페이지 분리)
 
-    Args:
-        hwpx_path: HWPX 파일 경로
-
     Returns:
         [{"page_num": 1, "text": "...(표 인라인 포함)", "tables": [...], "images": []}, ...]
     """
@@ -125,7 +124,7 @@ def extract_hwpx(hwpx_path: str) -> list:
         section_files = _find_section_files(zf)
 
         if not section_files:
-            print(f"⚠️ section XML을 찾을 수 없습니다. 파일 목록: {zf.namelist()[:10]}")
+            logger.warning("section XML을 찾을 수 없습니다. 파일 목록: %s", zf.namelist()[:10])
             return pages_result
 
         for sec_file in section_files:
@@ -162,19 +161,22 @@ def extract_hwpx(hwpx_path: str) -> list:
                     })
 
             except Exception as e:
-                print(f"⚠️ Section {sec_file} 파싱 오류: {e}")
+                logger.warning("Section %s 파싱 오류: %s", sec_file, e)
 
-    print(f"   HWPX 추출: {total_page_num}페이지, tables={sum(len(p['tables']) for p in pages_result)}")
+    logger.info(
+        "HWPX 추출: %d페이지, tables=%d",
+        total_page_num, sum(len(p["tables"]) for p in pages_result),
+    )
     return pages_result
 
 
 if __name__ == "__main__":
-    import sys as _sys
+    import sys
 
-    if len(_sys.argv) < 2:
-        print("Usage: python hwpx_extractor.py <file.hwpx>")
+    if len(sys.argv) < 2:
+        print("Usage: python -m src.v1_printed.hwpx_extractor <file.hwpx>")
         exit()
-    result = extract_hwpx(_sys.argv[1])
+    result = extract_hwpx(sys.argv[1])
     for p in result:
         print(f"\n--- Section {p['page_num']} ---")
         print(p["text"][:500])
