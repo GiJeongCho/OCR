@@ -10,7 +10,26 @@ Usage:
 """
 import argparse
 import os
+import socket
 import sys
+
+# 일부 사내/로컬 DNS는 모델 서버(바이두 bcebos.com CDN)를 해석하지 못한다.
+# 정상 해석이 가능하면 그대로 쓰고, 실패할 때만 확인된 CDN IP로 폴백한다.
+# (SNI/Host 헤더는 원래 도메인이 유지되므로 TLS 인증서 검증에는 영향 없음)
+_BAIDU_CDN_FALLBACK_IP = "103.235.47.176"
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_with_fallback(host, *args, **kwargs):
+    try:
+        return _orig_getaddrinfo(host, *args, **kwargs)
+    except socket.gaierror:
+        if isinstance(host, str) and host.endswith("bcebos.com"):
+            return _orig_getaddrinfo(_BAIDU_CDN_FALLBACK_IP, *args, **kwargs)
+        raise
+
+
+socket.getaddrinfo = _getaddrinfo_with_fallback
 
 
 def download_paddleocr(output_dir: str | None = None):

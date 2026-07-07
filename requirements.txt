@@ -10,8 +10,11 @@ lxml>=5.0.0
 pypdfium2>=4.0.0
 
 # === 스캔 PDF OCR 폴백 ===
-paddleocr>=2.8.0
-paddlepaddle-gpu>=2.6.0
+# 주의: paddleocr 3.x + paddlepaddle 2.6.x 는 비호환(set_optimization_level 에러).
+# paddlepaddle-gpu 는 PyPI에 없으므로 아래 전용 인덱스로 별도 설치:
+#   pip install paddlepaddle-gpu==2.6.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+paddleocr>=2.8.0,<3.0.0
+# paddlepaddle-gpu==2.6.2  # 위 전용 인덱스로 설치
 opencv-python-headless>=4.9.0
 numpy>=1.26.0
 Pillow>=10.0.0
